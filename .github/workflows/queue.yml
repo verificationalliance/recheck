@@ -11,6 +11,9 @@
 name: queue
 
 on:
+  # GitHub runs a schedule on the latest commit of the default branch, often some minutes late, and
+  # registers it from a commit that changes this file: after the workflow is disabled and enabled
+  # again, the schedule may not run until such a commit lands on main.
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
