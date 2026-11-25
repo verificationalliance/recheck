@@ -27,6 +27,7 @@ FIELDS = {
     'repo': 'github.com/verificationalliance/osva-monitor',
     'commit': '62af31fa2373855c2a84db4f8fb13763ff0b12c3',
     'run_id': 45534808080,
+    'artifact_id': 14986317770,
     'signer_sha': SHA,
     'manifest': '.verificationalliance.json',
 }
@@ -35,16 +36,16 @@ HOSTILE = '::error::planted'
 TAGS = '49cfc97142510641d339b20bac283c894f1ef10e\trefs/tags/workflow-7\n' + SHA + '\trefs/tags/workflow-7^{}\n'
 
 
-def id_of(repo, run_id):
-    return hashlib.sha256(('%s@%s' % (repo, run_id)).encode()).hexdigest()[:32]
+def id_of(repo, run_id, artifact_id=FIELDS['artifact_id']):
+    return hashlib.sha256(('%s@%s@%s' % (repo, run_id, artifact_id)).encode()).hexdigest()[:32]
 
 
 def make(**changes):
-    """An entry: FIELDS with the changes, and the id of its repo and run_id unless one is given."""
+    """An entry: FIELDS with the changes, and the id of its repo, run_id and artifact_id unless one is given."""
     e = dict(FIELDS)
     e.update(changes)
     if 'id' not in changes:
-        e['id'] = id_of(e.get('repo'), e.get('run_id'))
+        e['id'] = id_of(e.get('repo'), e.get('run_id'), e.get('artifact_id'))
     return e
 
 
@@ -68,8 +69,8 @@ class TestQueueValidate(unittest.TestCase):
         self.assertEqual(reasons, ['entry 2: ' + reason])
 
     def test_queue_validate(self):
-        # The entry of the end-to-end test: OSVA Monitor's run with workflow-7.
-        self.assertEqual(GOOD['id'], '26ae7a741a28f36a64f7bf99acedd6be')
+        # The entry of the end-to-end test: OSVA Monitor's run with workflow-7, and its artifact.
+        self.assertEqual(GOOD['id'], '8f4b2e916805a92b9104383c28c8a1f3')
         self.assertEqual(q.validate(doc(GOOD)), ([GOOD], []))
         for repo in ('github.com/verificationalliance/osva;monitor',
                      'github.com/verificationalliance/osva monitor',
@@ -96,6 +97,10 @@ class TestQueueValidate(unittest.TestCase):
             self.assert_dropped(make(run_id=run_id), q.R_RUN_ID)
         for run_id in (1, 45534808080, 10 ** 15 - 1):
             self.assertEqual(q.validate(doc(make(run_id=run_id)))[1], [])
+        for artifact_id in ('1', '14986317770', 0, -1, 10 ** 15, 1.0, True, None, [1]):
+            self.assert_dropped(make(artifact_id=artifact_id), q.R_ARTIFACT_ID)
+        for artifact_id in (1, 14986317770, 10 ** 15 - 1):
+            self.assertEqual(q.validate(doc(make(artifact_id=artifact_id)))[1], [])
         for id_ in (GOOD['id'].upper(), GOOD['id'][:31], GOOD['id'] + '0', GOOD['id'][:31] + 'g',
                     GOOD['id'] + '\n', 1):
             self.assert_dropped(make(id=id_), q.R_ID)
@@ -107,20 +112,24 @@ class TestQueueValidate(unittest.TestCase):
         for manifest in ('.verificationalliance.json', 'proofs/core.json', './a.json', 'a' * 255):
             self.assertEqual(q.validate(doc(make(manifest=manifest)))[1], [])
         self.assert_dropped(make(note=HOSTILE), q.R_KEYS)
-        missing = make()
-        del missing['manifest']
-        self.assert_dropped(missing, q.R_KEYS)
+        for key in ('manifest', 'artifact_id'):
+            missing = make()
+            del missing[key]
+            self.assert_dropped(missing, q.R_KEYS)
         self.assert_dropped('not an entry', q.R_NOT_OBJECT)
         self.assert_dropped(make(run_id=1, commit='0' * 40), q.R_DUPLICATE)
 
     def test_id_is_the_runs(self):
-        """The id is sha256("<repo>@<run_id>")[:32], as the server makes it: an id of another
-        run, or of the same run of another repository, is not the entry's."""
+        """The id is sha256("<repo>@<run_id>@<artifact_id>")[:32], as the server makes it: an id of
+        another run, of another artifact of the run (an attempt of it again), or of the same run of
+        another repository, is not the entry's."""
         self.assert_dropped(make(id=id_of(FIELDS['repo'], 45534808081)), q.R_BINDING)
+        self.assert_dropped(make(id=id_of(FIELDS['repo'], FIELDS['run_id'], 14986317771)), q.R_BINDING)
+        self.assert_dropped(make(id=hashlib.sha256(('%s@%s' % (FIELDS['repo'], FIELDS['run_id'])).encode()).hexdigest()[:32]), q.R_BINDING)
         self.assert_dropped(make(id=id_of('github.com/verificationalliance/other', FIELDS['run_id'])), q.R_BINDING)
         self.assert_dropped(make(id=id_of(FIELDS['repo'].upper(), FIELDS['run_id'])), q.R_BINDING)
         self.assert_dropped(make(id='0' * 32), q.R_BINDING)
-        self.assertEqual(q.entry_id(FIELDS['repo'], FIELDS['run_id']), GOOD['id'])
+        self.assertEqual(q.entry_id(FIELDS['repo'], FIELDS['run_id'], FIELDS['artifact_id']), GOOD['id'])
 
     def test_over_50_entries(self):
         kept, reasons = q.validate(doc(*several(53)))
@@ -256,6 +265,69 @@ class TestDone(unittest.TestCase):
         self.assertEqual(q.matrix([a], {a['id']}), [])
 
 
+class TestPages(unittest.TestCase):
+    """GitHub lists an entry's artifacts 100 to a page, and others' runs (a fork's pull request)
+    can upload artifacts by that name before ours: every page counts, up to the list's count and
+    MAX_PAGES pages."""
+
+    def folder(self, pages):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d)
+        for n, page in enumerate(pages, 1):
+            with open(os.path.join(d, 'artifacts-%s-%d.json' % (GOOD['id'], n)), 'w') as f:
+                f.write(page if isinstance(page, str) else json.dumps(page))
+        return d
+
+    def test_done_on_a_later_page(self):
+        i = GOOD['id']
+        fork = [artifact(i, 9000 + n, workflow_run={'head_repository_id': 2}) for n in range(150)]
+        pages = [{'total_count': 151, 'artifacts': fork[:100]}, {'total_count': 151, 'artifacts': fork[100:] + [artifact(i, 70)]}]
+        d = self.folder(pages)
+        self.assertTrue(q.more_pages(d, i, 1))
+        self.assertFalse(q.more_pages(d, i, 2))
+        self.assertEqual(q.recheck_runs(i, q.artifacts_of(d, i)), [70])
+        self.assertEqual(q.done_ids([GOOD], {i: q.artifacts_of(d, i)}, {70: run(70)}), {i})
+        self.assertEqual(q.recheck_runs(i, q.artifacts_of(self.folder(pages[:1]), i)), [], 'only the first page: not done')
+
+    def test_more_pages(self):
+        i = GOOD['id']
+        full = {'total_count': 5000, 'artifacts': [artifact(i, 1)] * 100}   # it counts more than 10 pages hold
+        d = self.folder([full] * q.MAX_PAGES)
+        self.assertEqual([q.more_pages(d, i, n) for n in range(1, q.MAX_PAGES + 1)], [True] * (q.MAX_PAGES - 1) + [False])
+        self.assertEqual(q.MAX_PAGES, 10)
+        self.assertEqual(len(q.artifacts_of(self.folder([full] * (q.MAX_PAGES + 2)), i)['artifacts']), 100 * q.MAX_PAGES)
+        for pages, why in (([{'total_count': 100, 'artifacts': [artifact(i, 1)] * 100}], 'all counted'),
+                           ([{'total_count': 500, 'artifacts': []}], 'an empty page'),
+                           ([{'artifacts': [artifact(i, 1)] * 100}], 'no count'),
+                           ([{'total_count': '500', 'artifacts': [artifact(i, 1)] * 100}], 'a count that is not a number'),
+                           (['[1, 2]'], 'not a page'), (['{'], 'not JSON')):
+            self.assertFalse(q.more_pages(self.folder(pages), i, 1), why)
+        self.assertFalse(q.more_pages(self.folder([full]), i, 2), 'page 2 not saved')
+        for page in (0, -1):
+            self.assertFalse(q.more_pages(d, i, page))
+        broken = self.folder([full, '{', {'total_count': 1000, 'artifacts': [artifact(i, 70)]}])
+        self.assertEqual(len(q.artifacts_of(broken, i)['artifacts']), 100, 'a page that is not one ends the list')
+
+    def test_the_workflow_asks_each_page(self):
+        text = workflow('queue.yml')
+        for line in ('gh api "repos/verificationalliance/recheck/actions/artifacts?name=osva-recheck-$id&per_page=100&page=$page" \\\n',
+                     '                > "$dir/artifacts-$id-$page.json"\n',
+                     '              python3 -I scripts/queue.py more "$dir" "$id" "$page" || break\n',
+                     '              page=$((page + 1))\n'):
+            self.assertIn(line, text)
+
+    def test_more_command(self):
+        i = GOOD['id']
+        d = self.folder([{'total_count': 200, 'artifacts': [artifact(i, 1)] * 100}])
+        run_script = lambda *a: subprocess.run([sys.executable, '-I', SCRIPT, *a], capture_output=True, text=True, env={})
+        self.assertEqual(run_script('more', d, i, '1').returncode, 0)
+        self.assertEqual(run_script('more', d, i, '2').returncode, 1)
+        for bad in (('more', d, '../x', '1'), ('more', d, i, '0'), ('more', d, i, 'x'), ('more', d, i)):
+            out = run_script(*bad)
+            self.assertNotEqual(out.returncode, 0, bad)
+            self.assertNotIn('Traceback', out.stderr)
+
+
 class TestReleases(unittest.TestCase):
 
     def test_releases(self):
@@ -302,7 +374,7 @@ class TestActionPin(unittest.TestCase):
 
 def env_of(e):
     return {'ID': e['id'], 'REPO': e['repo'], 'COMMIT': e['commit'], 'RUN_ID': str(e['run_id']),
-            'SIGNER_SHA': e['signer_sha'], 'MANIFEST': e['manifest']}
+            'ARTIFACT_ID': str(e['artifact_id']), 'SIGNER_SHA': e['signer_sha'], 'MANIFEST': e['manifest']}
 
 
 class TestEntry(unittest.TestCase):
@@ -316,7 +388,8 @@ class TestEntry(unittest.TestCase):
         self.assertEqual(q.entry_from_env(self.env()), GOOD)
         for bad in ({'RUN_ID': '01'}, {'RUN_ID': '1e3'}, {'RUN_ID': '1.0'}, {'RUN_ID': ' 1'},
                     {'RUN_ID': '٣'}, {'RUN_ID': '1' * 16}, {'RUN_ID': None}, {'REPO': HOSTILE},
-                    {'MANIFEST': None}, {'ID': ''}, {'RUN_ID': '45534808081'}):
+                    {'MANIFEST': None}, {'ID': ''}, {'RUN_ID': '45534808081'}, {'ARTIFACT_ID': None},
+                    {'ARTIFACT_ID': '01'}, {'ARTIFACT_ID': '1' * 16}, {'ARTIFACT_ID': '14986317771'}):
             self.assertIsNone(q.entry_from_env(self.env(**bad)), bad)
 
     def test_entry_from_env_released(self):
@@ -367,7 +440,7 @@ class TestPassedThrough(unittest.TestCase):
         # queue.yml hands the matrix values to recheck.yml's inputs, which reach queue.py's
         # environment as they are.
         env = {'ID': m['id'], 'REPO': m['repo'], 'COMMIT': m['commit'], 'RUN_ID': m['run_id'],
-               'SIGNER_SHA': m['signer_sha'], 'MANIFEST': m['manifest']}
+               'ARTIFACT_ID': m['artifact_id'], 'SIGNER_SHA': m['signer_sha'], 'MANIFEST': m['manifest']}
         self.assertEqual(q.entry_from_env(env), e)
         self.assertEqual(json.loads(q.canonical(q.entry_from_env(env))), e)
         return m
@@ -381,6 +454,16 @@ class TestPassedThrough(unittest.TestCase):
         for check in checks:
             self.assertIn('uses: verificationalliance/verify/.github/actions/check@', check)
             self.assertIn('          manifest: ${{ inputs.manifest }}\n', check)
+
+    def test_artifact_id_passed_through(self):
+        for artifact_id in (1, 14986317770, 10 ** 15 - 1):
+            self.assertEqual(self.through_the_workflows(make(artifact_id=artifact_id))['artifact_id'], str(artifact_id))
+        self.assertIn('      artifact-id: ${{ matrix.entry.artifact_id }}\n', workflow('queue.yml'))
+        text = workflow('recheck.yml')
+        self.assertIn('      artifact-id:\n', text)
+        for name in ('Check the entry', 'Validate the result'):
+            [step] = steps_named(text, name)
+            self.assertIn('          ARTIFACT_ID: ${{ inputs.artifact-id }}\n', step, name)
 
     def test_repo_case_kept(self):
         repo = 'github.com/VerificationAlliance/OSVA-Monitor.Lean_4'
@@ -437,7 +520,7 @@ class TestCommand(unittest.TestCase):
         # What the workflow then asks GitHub: each entry's artifacts, and the runs they name.
         for e, listed in ((a, listing()), (b, listing(artifact(b['id'], 70))),
                           (c, listing(artifact(c['id'], 71), artifact(c['id'], 70, workflow_run={'head_branch': 'x'})))):
-            with open(p('artifacts-%s.json' % e['id']), 'w') as f:
+            with open(p('artifacts-%s-1.json' % e['id']), 'w') as f:
                 json.dump(listed, f)
         out = self.run_script('runs', d)
         self.assertEqual((out.returncode, out.stdout), (0, '70\n71\n'))
@@ -472,7 +555,7 @@ class TestCommand(unittest.TestCase):
         out = self.run_script('entries', os.path.join(d, 'queue.json'), os.path.join(d, 'releases'))
         self.assertEqual((out.returncode, out.stdout), (0, '[]\n'))
         d = self.folder({'entries.json': json.dumps([GOOD]),
-                         'artifacts-%s.json' % GOOD['id']: json.dumps(listing(artifact(GOOD['id'], 70))),
+                         'artifacts-%s-1.json' % GOOD['id']: json.dumps(listing(artifact(GOOD['id'], 70))),
                          'run-70.json': json.dumps(run(70))})
         out = self.run_script('plan', d)
         self.assertEqual(out.stdout, 'matrix=[]\n')

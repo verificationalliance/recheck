@@ -319,7 +319,8 @@ class TestQueue(unittest.TestCase):
 
     def test_done_is_queue_yml_on_main(self):
         for line in ('python3 -I scripts/queue.py entries "$dir/queue.json" "$dir/releases" > "$dir/entries.json"',
-                     'gh api "repos/verificationalliance/recheck/actions/artifacts?name=osva-recheck-$id&per_page=100" \\',
+                     'gh api "repos/verificationalliance/recheck/actions/artifacts?name=osva-recheck-$id&per_page=100&page=$page" \\',
+                     'python3 -I scripts/queue.py more "$dir" "$id" "$page" || break',
                      'done < <(python3 -I scripts/queue.py ids "$dir/entries.json")',
                      'gh api "repos/verificationalliance/recheck/actions/runs/$run" > "$dir/run-$run.json"',
                      'done < <(python3 -I scripts/queue.py runs "$dir")',
