@@ -1,7 +1,7 @@
 # Every 5 minutes: reads the queue of signed results waiting for our re-check, which our server
 # publishes, and calls recheck.yml once for each entry not re-checked yet. recheck.yml uploads its
-# signed result as the artifact osva-recheck-<id>, which our server collects; an entry whose
-# artifact is here is done.
+# signed result as the artifact osva-recheck-<id>, which our server collects; an entry is done when
+# a run of this workflow on main uploaded its artifact.
 #
 # A maintainer can also start it by hand, with queue-url naming a test queue in this repository.
 #
@@ -36,6 +36,7 @@ defaults:
 jobs:
   plan:
     name: plan
+    if: github.repository == 'verificationalliance/recheck'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -62,23 +63,30 @@ jobs:
             echo "::error::queue-url must name a file of verificationalliance/recheck on raw.githubusercontent.com."
             exit 1
           fi
+          dir="$RUNNER_TEMP/plan"
+          mkdir "$dir"
           curl -fsS --proto '=https' --tlsv1.2 --retry 3 --max-time 60 --max-filesize 1000000 \
-            -o "$RUNNER_TEMP/queue.json" "$url"
-          # The re-checks done: this repository's artifacts that have not expired.
-          gh api --paginate 'repos/verificationalliance/recheck/actions/artifacts?per_page=100' \
-            --jq '.artifacts[] | select(.expired | not) | .name' > "$RUNNER_TEMP/artifacts"
+            -o "$dir/queue.json" "$url"
           # The workflow releases: a signer_sha must be the commit of one.
-          git ls-remote --tags https://github.com/verificationalliance/verify 'refs/tags/workflow-*' \
-            > "$RUNNER_TEMP/releases"
-          python3 -I scripts/queue.py plan "$RUNNER_TEMP/queue.json" "$RUNNER_TEMP/artifacts" \
-            "$RUNNER_TEMP/releases" >> "$GITHUB_OUTPUT"
+          git ls-remote --tags https://github.com/verificationalliance/verify 'refs/tags/workflow-*' > "$dir/releases"
+          python3 -I scripts/queue.py entries "$dir/queue.json" "$dir/releases" > "$dir/entries.json"
+          # The re-checks done: each entry's artifact osva-recheck-<id>, and the runs that uploaded
+          # one. queue.py counts only a run of queue.yml on this repository's main.
+          while read -r id; do
+            gh api "repos/verificationalliance/recheck/actions/artifacts?name=osva-recheck-$id&per_page=100" \
+              > "$dir/artifacts-$id.json"
+          done < <(python3 -I scripts/queue.py ids "$dir/entries.json")
+          while read -r run; do
+            gh api "repos/verificationalliance/recheck/actions/runs/$run" > "$dir/run-$run.json"
+          done < <(python3 -I scripts/queue.py runs "$dir")
+          python3 -I scripts/queue.py plan "$dir" >> "$GITHUB_OUTPUT"
 
   # The job's permissions are what recheck.yml's jobs may have at most: its check job takes
   # contents and actions read only, its sign job id-token and attestations write.
   recheck:
     name: recheck ${{ matrix.entry.id }}
     needs: plan
-    if: needs.plan.outputs.matrix != '[]'
+    if: github.repository == 'verificationalliance/recheck' && needs.plan.outputs.matrix != '[]'
     strategy:
       matrix:
         entry: ${{ fromJSON(needs.plan.outputs.matrix) }}

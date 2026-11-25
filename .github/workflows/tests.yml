@@ -1,0 +1,33 @@
+# The unit tests, on every push and pull request. RECHECK_ONLINE=1 also checks recheck.yml's steps
+# against the check action that each workflow release of verificationalliance/verify pins.
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  unit:
+    name: unit tests
+    if: github.repository == 'verificationalliance/recheck'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run the tests
+        env:
+          RECHECK_ONLINE: "1"
+        run: python3 -I -m unittest discover -s tests -v

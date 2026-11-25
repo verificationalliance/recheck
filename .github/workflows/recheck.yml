@@ -4,16 +4,17 @@
 # check.
 #
 # It runs the same check as the developer's run: verificationalliance/verify's composite action
-# .github/actions/check, at the commit that the signing release's lean.yml pins. The action checks
-# out the developer's commit and replays the export the developer's build job made, downloaded from
-# that run; the export is never trusted, only replayed and compared. Our result must then equal the
-# developer's byte for byte, which our server checks.
+# .github/actions/check, at the commit that the signing release's lean.yml pins, by a step pinned to
+# that commit for each release this workflow knows. The action checks out the developer's commit and
+# replays the export the developer's build job made, downloaded from that run; the export is never
+# trusted, only replayed and compared. Our result must then equal the developer's byte for byte,
+# which our server checks.
 #
 # The trust boundary is lean.yml's:
 # - `check` runs nothing from the repository: the action's sandboxed steps only. It has no id-token.
 # - `sign` runs no Lean and never sees the export. It receives result.json as a job output, never as
 #   an artifact (any job of the run can upload one), validates it, checks that it is for the entry's
-#   repository and commit, and has GitHub sign it.
+#   repository and commit, and has GitHub sign it together with entry.json, the entry it is for.
 # One entry per call is what keeps that so: the jobs of a matrix share one set of outputs, and a
 # call has its own.
 #
@@ -77,7 +78,7 @@ jobs:
       contents: read
       actions: read
     outputs:
-      result: ${{ steps.result.outputs.result }}
+      result: ${{ steps.result_7.outputs.result }}
     steps:
       - name: Check out the re-check's scripts
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -85,6 +86,7 @@ jobs:
           path: recheck
           persist-credentials: false
 
+      # Every field against its pattern, and the signer once more a workflow release's commit.
       - name: Check the entry
         id: entry
         env:
@@ -95,7 +97,8 @@ jobs:
           SIGNER_SHA: ${{ inputs.signer-sha }}
           MANIFEST: ${{ inputs.manifest }}
         run: |
-          python3 -I recheck/scripts/queue.py entry > /dev/null
+          git ls-remote --tags https://github.com/verificationalliance/verify 'refs/tags/workflow-*' > "$RUNNER_TEMP/releases"
+          python3 -I recheck/scripts/queue.py entry "$RUNNER_TEMP/releases" > /dev/null
           echo "repository=${REPO#github.com/}" >> "$GITHUB_OUTPUT"
 
       - name: Check out the release that signed the result
@@ -106,42 +109,30 @@ jobs:
           path: signer
           persist-credentials: false
 
+      # The check action runs by a step of its own for each release this workflow knows, pinned to
+      # the commit that release's lean.yml pins (tests/test_workflows.py's RELEASES): the runner
+      # fetches it, as any action, and never reads it from the workspace, which the action's
+      # checkout makes the developer's commit. A release whose lean.yml pins another commit is
+      # re-checked only once a step for it is added here.
       - name: Read the check action's pin
         id: pin
+        env:
+          KNOWN: "3762b051c259ce791cf76af48c20ae3f1bbd5476"
         run: |
           pin=$(python3 -I recheck/scripts/queue.py pin signer/.github/workflows/lean.yml)
-          echo "pin=$pin" >> "$GITHUB_OUTPUT"
-          echo "The release's lean.yml runs the check action at $pin."
-
-      # In the workspace, as `uses: ./` requires. The runner reads the action when its step starts,
-      # and the action's first checkout then replaces the workspace with the developer's commit:
-      # vacheck hashes every file of the checkout, so nothing of ours may be left in it. A copy
-      # outside the workspace is put back for the action's post steps.
-      - name: Check out the check action at that pin
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: verificationalliance/verify
-          ref: ${{ steps.pin.outputs.pin }}
-          path: verify-action
-          persist-credentials: false
-
-      # scripts/release.sh's rule, checked again: the action at the pin is the release's own
-      # .github/actions/check, file for file.
-      - name: Require the release's own check action
-        run: |
-          release=$(git -C signer rev-parse 'HEAD:.github/actions/check')
-          pinned=$(git -C verify-action rev-parse 'HEAD:.github/actions/check')
-          if [[ $release != "$pinned" ]]; then
-            echo "::error::The check action at the pin is not the release's own."
+          if [[ " $KNOWN " != *" $pin "* ]]; then
+            echo "::error::The release's lean.yml pins a check action that this workflow does not run."
             exit 1
           fi
+          echo "pin=$pin" >> "$GITHUB_OUTPUT"
+          echo "The release's lean.yml runs the check action at $pin."
+          # vacheck hashes every file of the checkout, so nothing of ours may be left in it.
           rm -rf recheck signer
-          cp -a verify-action "$RUNNER_TEMP/check-action"
-          echo "The check action at the pin is the release's own: tree $pinned."
 
-      - name: Check the export
-        id: result
-        uses: ./verify-action/.github/actions/check
+      - name: Check the export (workflow-7)
+        id: result_7
+        if: steps.pin.outputs.pin == '3762b051c259ce791cf76af48c20ae3f1bbd5476'
+        uses: verificationalliance/verify/.github/actions/check@3762b051c259ce791cf76af48c20ae3f1bbd5476 # workflow-7-action
         with:
           manifest: ${{ inputs.manifest }}
           repository: ${{ steps.entry.outputs.repository }}
@@ -149,17 +140,6 @@ jobs:
           export-run-id: ${{ inputs.run-id }}
           export-repository: ${{ steps.entry.outputs.repository }}
           github-token: ${{ github.token }}
-
-      # The runner reads the action's definition again for its post steps, from verify-action/, and
-      # by then the workspace is the developer's commit, which may hold a verify-action/ of its own.
-      # Our copy goes back first, whatever happened to the check.
-      - name: Put the check action back for its post steps
-        if: always()
-        run: |
-          rm -rf -- "$GITHUB_WORKSPACE/verify-action"
-          if [[ -d $RUNNER_TEMP/check-action ]]; then
-            cp -a -- "$RUNNER_TEMP/check-action" "$GITHUB_WORKSPACE/verify-action"
-          fi
 
   sign:
     name: sign
@@ -227,7 +207,9 @@ jobs:
         id: attest
         uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
         with:
-          subject-path: result.json
+          subject-path: |
+            result.json
+            entry.json
           predicate-type: https://verificationalliance.org/attestations/proof-check/v1
           predicate-path: result.json
 
