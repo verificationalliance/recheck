@@ -10,17 +10,23 @@
 - the steps that keep the trust boundary are there: the entry's checks, the result's validation,
   and sign taking the result from check's output only;
 - sign signs under the predicate type of the result's own schema (v2), and a check of ours that
-  stopped is counted and failed, never signed.
+  stopped is counted and failed, never signed;
+- queue.yml dispatches its own next run (GitHub's scheduler does not run it), with actions: write
+  only, from main only, and never beside another run of it waiting or running.
 With RECHECK_ONLINE=1, as in tests.yml, queue.py's RELEASES and recheck.yml's checker are checked
 against verificationalliance/verify."""
 import importlib.util
+import json
 import os
 import re
+import shutil
 import subprocess
 import unittest
 import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# The runs of queue.yml besides this one that wait or run, as the next job counts them.
+OTHERS = '[.workflow_runs[] | select(.id != ($ENV.GITHUB_RUN_ID | tonumber) and .status != "completed")] | length'
 WORKFLOWS = os.path.join(ROOT, '.github', 'workflows')
 PINNED = re.compile(r'[A-Za-z0-9-]+/[A-Za-z0-9._-]+(?:/[A-Za-z0-9._/-]+)?@[0-9a-f]{40} # \S+')
 GUARD = "if: github.repository == 'verificationalliance/recheck'"
@@ -163,8 +169,8 @@ class TestWorkflows(unittest.TestCase):
                 self.assertEqual(len(conditions), 1, (name, job))
                 self.assertTrue(conditions[0] == '    ' + GUARD or conditions[0].startswith('    ' + GUARD + ' && '),
                                 (name, job, conditions[0]))
-        self.assertEqual(sorted(found), [('queue.yml', 'plan'), ('queue.yml', 'recheck'), ('recheck.yml', 'check'),
-                                         ('recheck.yml', 'sign'), ('tests.yml', 'unit')])
+        self.assertEqual(sorted(found), [('queue.yml', 'next'), ('queue.yml', 'plan'), ('queue.yml', 'recheck'),
+                                         ('recheck.yml', 'check'), ('recheck.yml', 'sign'), ('tests.yml', 'unit')])
 
     def test_jobs_regex_reads_every_name(self):
         lines = ['jobs:', '  upload_2:', '    if: x', '  a-b:', '    runs-on: y']
@@ -182,6 +188,7 @@ class TestWorkflows(unittest.TestCase):
         self.assertEqual(found, {
             ('recheck.yml', 'sign', 'id-token: write'), ('recheck.yml', 'sign', 'attestations: write'),
             ('queue.yml', 'recheck', 'id-token: write'), ('queue.yml', 'recheck', 'attestations: write'),
+            ('queue.yml', 'next', 'actions: write'),
         })
 
     def permissions(self, job_lines):
@@ -194,6 +201,7 @@ class TestWorkflows(unittest.TestCase):
         self.assertEqual(self.permissions(recheck['check']), ['contents: read', 'actions: read'])
         self.assertEqual(self.permissions(recheck['sign']), ['contents: read', 'id-token: write', 'attestations: write'])
         self.assertEqual(self.permissions(queue['plan']), ['contents: read', 'actions: read'])
+        self.assertEqual(self.permissions(queue['next']), ['actions: write'])
         self.assertEqual(self.permissions(tests['unit']), ['contents: read'])
         for name, lines in w.items():
             top = lines.index('permissions:')
@@ -375,6 +383,52 @@ class TestQueue(unittest.TestCase):
         text = '\n'.join(self.lines)
         self.assertIn('on:\n', text)
         self.assertEqual(re.findall(r'^ *- cron: (.*)$', text, re.M), ['"2-59/5 * * * *"'])
+
+    def test_chain(self):
+        """Each run dispatches the next, 5 minutes after its work, whatever became of that work, but
+        not after a cancel; only from main and this repository; with no inputs, so a test queue is
+        never carried on; and only when no other run of queue.yml waits or runs: the concurrency
+        group keeps one run going and one waiting, and a new waiting run replaces the old."""
+        text = '\n'.join(self.lines)
+        self.assertIn('concurrency:\n  group: recheck\n  cancel-in-progress: false\n', text)
+        self.assertEqual(re.findall(r'^ *- cron: (.*)$', text, re.M), ['"2-59/5 * * * *"'], 'the schedule stays')
+        nxt = jobs(self.lines)['next']
+        self.assertIn('    needs: [plan, recheck]', nxt)
+        self.assertIn("    if: github.repository == 'verificationalliance/recheck' && github.ref == 'refs/heads/main'"
+                      " && !cancelled()", nxt)
+        self.assertIn('    runs-on: ubuntu-24.04', nxt)
+        self.assertIn('    timeout-minutes: 10', nxt)
+        self.assertEqual([n for n, _ in steps(nxt)], ['Dispatch the next run'])
+        dispatch = step(nxt, 'Dispatch the next run')
+        self.assertEqual(value(dispatch, 'GH_TOKEN'), '${{ github.token }}')
+        self.assertNotIn('uses:', '\n'.join(dispatch))
+        run = '\n'.join(script(dispatch))
+        lines = [line.strip() for line in script(dispatch)]
+        self.assertEqual(lines[1], 'sleep 300')
+        self.assertIn("others=$(gh api 'repos/verificationalliance/recheck/actions/workflows/queue.yml/runs?per_page=30' \\", run)
+        self.assertIn('--jq \'%s\') || others=unknown' % OTHERS, run)
+        self.assertIn('if [[ $others =~ ^[1-9][0-9]*$ ]]; then', run)
+        self.assertEqual(re.findall(r'gh api -X POST (.*)', run),
+                         ['repos/verificationalliance/recheck/actions/workflows/queue.yml/dispatches -f ref=main; then'])
+        self.assertNotIn('inputs', run)
+        self.assertLess(run.index('if [[ $others =~'), run.index('gh api -X POST'))
+
+    @unittest.skipUnless(shutil.which('jq'), 'needs jq')
+    def test_others(self):
+        """OTHERS, as jq runs it on GitHub's list of queue.yml's runs: the runs besides this one that
+        are not completed."""
+        def others(statuses, me=7):
+            runs = {'total_count': len(statuses),
+                    'workflow_runs': [{'id': i, 'status': st} for i, st in enumerate(statuses, 7)]}
+            out = subprocess.run(['jq', OTHERS], input=json.dumps(runs), capture_output=True, text=True,
+                                 env={'GITHUB_RUN_ID': str(me), 'PATH': os.environ.get('PATH', '')}, check=True)
+            return int(out.stdout)
+        self.assertEqual(others(['in_progress']), 0, 'only this run')
+        self.assertEqual(others(['in_progress', 'completed', 'completed']), 0)
+        for status in ('queued', 'pending', 'waiting', 'requested', 'in_progress'):
+            self.assertEqual(others(['in_progress', status]), 1, status)
+        self.assertEqual(others(['completed', 'queued'], me=8), 0, 'the waiting one is this run')
+        self.assertEqual(others([]), 0)
 
     def test_recheck_job(self):
         recheck = jobs(self.lines)['recheck']

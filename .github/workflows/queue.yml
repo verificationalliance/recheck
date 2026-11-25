@@ -1,7 +1,11 @@
-# Every 5 minutes: reads the queue of signed results waiting for our re-check, which our server
+# About every 5 minutes: reads the queue of signed results waiting for our re-check, which our server
 # publishes, and calls recheck.yml once for each entry not re-checked yet. recheck.yml uploads its
 # signed result as the artifact osva-recheck-<id>, which our server collects; an entry is done when
 # a run of this workflow on main uploaded its artifact.
+#
+# GitHub's scheduler has never run this workflow's schedule, so each run ends by dispatching the
+# next, 5 minutes after its work (job next). The schedule stays, should GitHub start running it. A
+# run cancelled by hand dispatches nothing: start the chain again with one dispatch on main.
 #
 # A maintainer can also start it by hand, with queue-url naming a test queue in this repository.
 #
@@ -119,3 +123,39 @@ jobs:
       artifact-id: ${{ matrix.entry.artifact_id }}
       signer-sha: ${{ matrix.entry.signer_sha }}
       manifest: ${{ matrix.entry.manifest }}
+
+  # The chain: 5 minutes after the work above, whatever became of it (but not after a cancel), the
+  # next run of this workflow on main, with no inputs, so a test queue is never carried on. The
+  # concurrency group keeps one run going and one waiting, and a newer waiting run replaces the
+  # older before it starts, so two chains never run side by side; and when another run already
+  # waits or runs (one started by hand, or by GitHub's schedule), it is the next one, and this run
+  # dispatches nothing, rather than replace it. If that count cannot be read, it dispatches anyway.
+  next:
+    name: next
+    needs: [plan, recheck]
+    if: github.repository == 'verificationalliance/recheck' && github.ref == 'refs/heads/main' && !cancelled()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: write
+    steps:
+      - name: Dispatch the next run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sleep 300
+          others=$(gh api 'repos/verificationalliance/recheck/actions/workflows/queue.yml/runs?per_page=30' \
+            --jq '[.workflow_runs[] | select(.id != ($ENV.GITHUB_RUN_ID | tonumber) and .status != "completed")] | length') || others=unknown
+          if [[ $others =~ ^[1-9][0-9]*$ ]]; then
+            echo "Another run of queue.yml waits or runs: it is the next one."
+            exit 0
+          fi
+          for attempt in 1 2 3; do
+            if gh api -X POST repos/verificationalliance/recheck/actions/workflows/queue.yml/dispatches -f ref=main; then
+              echo "Dispatched the next run of queue.yml on main."
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "::error::The next run of queue.yml could not be dispatched: the chain stops here."
+          exit 1
