@@ -66,23 +66,25 @@ defaults:
     shell: bash --noprofile --norc -euo pipefail {0}
 
 env:
-  # lean.yml's checker in workflow-7; job sign only validates with it.
-  VACHECK_URL: https://github.com/verificationalliance/verify/releases/download/v1.1.4/vacheck.pyz
-  VACHECK_SHA256: 3e5881d0863b3edcd679b4029b1e8a0534576c119d601f8268299d02c999a33b
+  # lean.yml's checker in workflow-10; job sign only validates with it.
+  VACHECK_URL: https://github.com/verificationalliance/verify/releases/download/v2.0.2/vacheck.pyz
+  VACHECK_SHA256: b98de62f3e813c89f1f31224ad226db0b2bc916d9202edd06676c6eba1c9f905
   # The base64 of vacheck's largest result (96,000 bytes), as lean.yml takes it.
   MAX_RESULT_B64: "128000"
 
 jobs:
+  # 240 minutes, as the release's own check job: the kernels' replay of a large export, then the
+  # sanity step's own 30-minute safety net, which must not be what stops the job.
   check:
     name: check
     if: github.repository == 'verificationalliance/recheck'
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 240
     permissions:
       contents: read
       actions: read
     outputs:
-      result: ${{ steps.result_7.outputs.result }}
+      result: ${{ steps.result_10.outputs.result }}
     steps:
       - name: Check out the re-check's scripts
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -115,14 +117,14 @@ jobs:
           persist-credentials: false
 
       # The check action runs by a step of its own for each release this workflow knows, pinned to
-      # the commit that release's lean.yml pins (tests/test_workflows.py's RELEASES): the runner
+      # the commit that release's lean.yml pins (scripts/queue.py's RELEASES): the runner
       # fetches it, as any action, and never reads it from the workspace, which the action's
       # checkout makes the developer's commit. A release whose lean.yml pins another commit is
       # re-checked only once a step for it is added here.
       - name: Read the check action's pin
         id: pin
         env:
-          KNOWN: "3762b051c259ce791cf76af48c20ae3f1bbd5476"
+          KNOWN: "e857d7a7e58ca573a3d233f8547c5c62b5fd82f1"
         run: |
           pin=$(python3 -I recheck/scripts/queue.py pin signer/.github/workflows/lean.yml)
           if [[ " $KNOWN " != *" $pin "* ]]; then
@@ -134,10 +136,10 @@ jobs:
           # vacheck hashes every file of the checkout, so nothing of ours may be left in it.
           rm -rf recheck signer
 
-      - name: Check the export (workflow-7)
-        id: result_7
-        if: steps.pin.outputs.pin == '3762b051c259ce791cf76af48c20ae3f1bbd5476'
-        uses: verificationalliance/verify/.github/actions/check@3762b051c259ce791cf76af48c20ae3f1bbd5476 # workflow-7-action
+      - name: Check the export (workflow-10)
+        id: result_10
+        if: steps.pin.outputs.pin == 'e857d7a7e58ca573a3d233f8547c5c62b5fd82f1'
+        uses: verificationalliance/verify/.github/actions/check@e857d7a7e58ca573a3d233f8547c5c62b5fd82f1 # workflow-10-action
         with:
           manifest: ${{ inputs.manifest }}
           repository: ${{ steps.entry.outputs.repository }}
@@ -183,7 +185,10 @@ jobs:
 
       # As lean.yml's sign job: canonical JSON that vacheck accepts, for the entry's repository and
       # commit. entry.json is the entry as queue.py checked and wrote it, never the queue's bytes.
+      # The result's schema names the predicate type it is signed under, and must be v2; its sanity
+      # says whether our check got to a verdict.
       - name: Validate the result
+        id: validate
         env:
           RESULT: ${{ needs.check.outputs.result }}
           ID: ${{ inputs.id }}
@@ -207,7 +212,28 @@ jobs:
             exit 1
           fi
           python3 -I recheck/scripts/queue.py same-entry result.json
+          python3 -I recheck/scripts/queue.py result result.json >> "$GITHUB_OUTPUT"
           echo "result.json: sha256 $(sha256sum < result.json | cut -d ' ' -f 1)"
+
+      # Our check stopped before every pair had a verdict (the sanity step's safety net, or a
+      # crash), so there is nothing to compare: it is neither signed nor uploaded, and the next run
+      # of queue.yml tries again. This artifact counts the tries; queue.yml gives the entry up after
+      # 3, and our server's own time limit ends it.
+      - name: Count a stopped check
+        if: steps.validate.outputs.sanity == 'stopped'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: osva-recheck-stopped-${{ inputs.id }}
+          path: entry.json
+          retention-days: 14
+          overwrite: true
+          if-no-files-found: error
+
+      - name: Stop on a stopped check
+        if: steps.validate.outputs.sanity == 'stopped'
+        run: |
+          echo "::error::Our check stopped before every pair had a verdict: nothing is signed, and the next run tries again."
+          exit 1
 
       - name: Sign the result
         id: attest
@@ -216,7 +242,7 @@ jobs:
           subject-path: |
             result.json
             entry.json
-          predicate-type: https://verificationalliance.org/attestations/proof-check/v1
+          predicate-type: ${{ steps.validate.outputs.predicate-type }}
           predicate-path: result.json
 
       - name: Keep the bundle

@@ -8,8 +8,11 @@
 - recheck.yml runs the check action of each workflow release it knows by a step of its own, pinned
   to the commit that release's lean.yml pins, and runs no other;
 - the steps that keep the trust boundary are there: the entry's checks, the result's validation,
-  and sign taking the result from check's output only.
-With RECHECK_ONLINE=1, as in tests.yml, RELEASES is checked against verificationalliance/verify."""
+  and sign taking the result from check's output only;
+- sign signs under the predicate type of the result's own schema (v2), and a check of ours that
+  stopped is counted and failed, never signed.
+With RECHECK_ONLINE=1, as in tests.yml, queue.py's RELEASES and recheck.yml's checker are checked
+against verificationalliance/verify."""
 import importlib.util
 import os
 import re
@@ -23,15 +26,16 @@ PINNED = re.compile(r'[A-Za-z0-9-]+/[A-Za-z0-9._-]+(?:/[A-Za-z0-9._/-]+)?@[0-9a-
 GUARD = "if: github.repository == 'verificationalliance/recheck'"
 LS_REMOTE = "git ls-remote --tags https://github.com/verificationalliance/verify 'refs/tags/workflow-*'"
 
-# The workflow releases recheck.yml re-checks: each release's commit, and the commit of the check
-# action that its lean.yml pins. Adding a release adds a line here and a step to recheck.yml.
-RELEASES = {
-    7: ('ba4c212aefe24cded13faa30f781c4197751c8b9', '3762b051c259ce791cf76af48c20ae3f1bbd5476'),
-}
-
 _spec = importlib.util.spec_from_file_location('recheck_queue', os.path.join(ROOT, 'scripts', 'queue.py'))
 q = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(q)
+
+# The workflow releases recheck.yml re-checks (queue.py's): each release's commit, and the commit of
+# the check action that its lean.yml pins. Adding a release adds a line there and a step to
+# recheck.yml.
+RELEASES = q.RELEASES
+VACHECK = ('https://github.com/verificationalliance/verify/releases/download/v2.0.2/vacheck.pyz',
+           'b98de62f3e813c89f1f31224ad226db0b2bc916d9202edd06676c6eba1c9f905')
 
 
 def indent(line):
@@ -237,6 +241,13 @@ class TestRecheck(unittest.TestCase):
         # checkout replaced it.
         self.assertNotRegex(self.text, r'uses: \./|verify-action')
 
+    def test_timeouts(self):
+        # The release's own check job: the kernels' replay, then the sanity step's 30-minute
+        # safety net, which must not be what stops the job.
+        self.assertIn('    timeout-minutes: 240', self.jobs['check'])
+        self.assertIn('    timeout-minutes: 15', self.jobs['sign'])
+        self.assertEqual(sorted(RELEASES), [10])
+
     def test_check_checks_the_entry(self):
         check = self.jobs['check']
         names = [n for n, _ in steps(check)]
@@ -264,20 +275,46 @@ class TestRecheck(unittest.TestCase):
                      'printf \'%s\' "$RESULT" | base64 -d > "$va/received.json"',
                      'python3 -I "$va/vacheck.pyz" validate "$va/received.json" > result.json',
                      'if ! cmp -s "$va/received.json" result.json; then',
-                     'python3 -I recheck/scripts/queue.py same-entry result.json'):
+                     'python3 -I recheck/scripts/queue.py same-entry result.json',
+                     'python3 -I recheck/scripts/queue.py result result.json >> "$GITHUB_OUTPUT"'):
             self.assertIn(line, run)
+        self.assertEqual(value(validate, 'id'), 'validate')
         names = [n for n, _ in steps(sign)]
         self.assertEqual(names, ['Require a standard GitHub-hosted runner', "Check out the re-check's scripts",
-                                 'Get the checker', 'Validate the result', 'Sign the result', 'Keep the bundle',
-                                 'Upload the re-check'])
+                                 'Get the checker', 'Validate the result', 'Count a stopped check',
+                                 'Stop on a stopped check', 'Sign the result', 'Keep the bundle', 'Upload the re-check'])
         self.assertIn('echo "$VACHECK_SHA256  $va/vacheck.pyz" | sha256sum -c -', '\n'.join(script(step(sign, 'Get the checker'))))
+        top = block(self.lines, self.lines.index('env:'))
+        self.assertIn('  VACHECK_URL: ' + VACHECK[0], top)
+        self.assertIn('  VACHECK_SHA256: ' + VACHECK[1], top)
+
+    def test_a_stopped_check_is_counted_and_failed(self):
+        """Our check stopped before every pair had a verdict: nothing to compare. sign uploads a
+        marker that queue.yml counts, fails before signing, and so uploads no result."""
+        sign = self.jobs['sign']
+        stopped = "steps.validate.outputs.sanity == 'stopped'"
+        count = step(sign, 'Count a stopped check')
+        self.assertEqual(value(count, 'if'), stopped)
+        self.assertEqual(value(count, 'uses'), 'actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2')
+        self.assertEqual(value(count, 'name'), 'osva-recheck-stopped-${{ inputs.id }}')
+        self.assertEqual(value(count, 'path'), 'entry.json')
+        self.assertEqual(value(count, 'retention-days'), '14')
+        fail = step(sign, 'Stop on a stopped check')
+        self.assertEqual(value(fail, 'if'), stopped)
+        self.assertIn('  exit 1', '\n'.join(script(fail)))
+        # Every step after them runs only if they did not fail: none has a condition of its own.
+        names = [n for n, _ in steps(sign)]
+        for name in names[names.index('Stop on a stopped check') + 1:]:
+            self.assertIsNone(value(step(sign, name), 'if'), name)
 
     def test_sign_attests_result_and_entry(self):
         attest = step(self.jobs['sign'], 'Sign the result')
         i = [k for k, line in enumerate(attest) if line.strip() == 'subject-path: |'][0]
         self.assertEqual([line.strip() for line in block(attest, i)], ['result.json', 'entry.json'])
         self.assertEqual(value(attest, 'predicate-path'), 'result.json')
-        self.assertEqual(value(attest, 'predicate-type'), 'https://verificationalliance.org/attestations/proof-check/v1')
+        # The result's own schema, which queue.py result requires to be v2.
+        self.assertEqual(value(attest, 'predicate-type'), '${{ steps.validate.outputs.predicate-type }}')
+        self.assertEqual(q.SCHEMA, 'https://verificationalliance.org/attestations/proof-check/v2')
         upload = step(self.jobs['sign'], 'Upload the re-check')
         self.assertEqual(value(upload, 'name'), 'osva-recheck-${{ inputs.id }}')
         self.assertEqual(value(upload, 'retention-days'), '7')
@@ -319,8 +356,11 @@ class TestQueue(unittest.TestCase):
 
     def test_done_is_queue_yml_on_main(self):
         for line in ('python3 -I scripts/queue.py entries "$dir/queue.json" "$dir/releases" > "$dir/entries.json"',
-                     'gh api "repos/verificationalliance/recheck/actions/artifacts?name=osva-recheck-$id&per_page=100&page=$page" \\',
-                     'python3 -I scripts/queue.py more "$dir" "$id" "$page" || break',
+                     'for kind in artifacts stops; do',
+                     'if [[ $kind == stops ]]; then name=osva-recheck-stopped-$id; else name=osva-recheck-$id; fi',
+                     'gh api "repos/verificationalliance/recheck/actions/artifacts?name=$name&per_page=100&page=$page" \\',
+                     '> "$dir/$kind-$id-$page.json"',
+                     'python3 -I scripts/queue.py more "$dir" "$id" "$page" "$kind" || break',
                      'done < <(python3 -I scripts/queue.py ids "$dir/entries.json")',
                      'gh api "repos/verificationalliance/recheck/actions/runs/$run" > "$dir/run-$run.json"',
                      'done < <(python3 -I scripts/queue.py runs "$dir")',
@@ -349,7 +389,7 @@ class TestReadme(unittest.TestCase):
             '--repo', 'verificationalliance/recheck',
             '--signer-workflow', 'verificationalliance/recheck/.github/workflows/recheck.yml',
             '--signer-digest', '<commit>', '--source-ref', 'refs/heads/main', '--deny-self-hosted-runners',
-            '--predicate-type', 'https://verificationalliance.org/attestations/proof-check/v1'])
+            '--predicate-type', 'https://verificationalliance.org/attestations/proof-check/v2'])
 
 
 class TestTests(unittest.TestCase):
@@ -374,7 +414,16 @@ class TestReleasesOnline(unittest.TestCase):
             self.assertIn('%s\trefs/tags/workflow-%d^{}' % (release, n), tags.split('\n'))
             url = 'https://raw.githubusercontent.com/verificationalliance/verify/%s/.github/workflows/lean.yml' % release
             with urllib.request.urlopen(url, timeout=30) as r:
-                self.assertEqual(q.action_pin(r.read().decode('utf-8')), pin, n)
+                lean = r.read().decode('utf-8')
+            self.assertEqual(q.action_pin(lean), pin, n)
+            # sign validates with the release's own checker.
+            self.assertIn('  VACHECK_URL: %s\n' % VACHECK[0], lean)
+            self.assertIn('  VACHECK_SHA256: %s\n' % VACHECK[1], lean)
+
+    def test_checker_is_the_release_asset(self):
+        import hashlib
+        with urllib.request.urlopen(VACHECK[0], timeout=60) as r:
+            self.assertEqual(hashlib.sha256(r.read()).hexdigest(), VACHECK[1])
 
 
 if __name__ == '__main__':

@@ -19,33 +19,39 @@ runner reads workflow commands in the log.
 
 queue.yml's plan job runs, in turn:
   queue.py entries QUEUE RELEASES > DIR/entries.json
-      the entries of QUEUE, the queue file, whose signer_sha is the commit of a workflow-<n> tag in
-      RELEASES, `git ls-remote --tags` of verificationalliance/verify (a commit of a fork can be
-      fetched through the repository too). The reasons go to stderr; a file that is not the queue
-      fails.
+      the entries of QUEUE, the queue file, signed by a release this repository re-checks (RELEASES
+      below) that is still the commit of its workflow-<n> tag in RELEASES, `git ls-remote --tags` of
+      verificationalliance/verify (a commit of a fork can be fetched through the repository too).
+      The reasons go to stderr; a file that is not the queue fails.
   queue.py ids DIR/entries.json
-      their ids, one per line. The job saves GitHub's list of each one's artifacts named
-      osva-recheck-<id>, a page of 100 at a time, as DIR/artifacts-<id>-<page>.json, while
-  queue.py more DIR ID PAGE
+      their ids, one per line. For each, the job saves GitHub's lists of two kinds of artifact, a
+      page of 100 at a time, as DIR/<kind>-<id>-<page>.json: `artifacts`, named osva-recheck-<id>,
+      our re-checks; and `stops`, named osva-recheck-stopped-<id>, which recheck.yml uploads when
+      our check stopped before every pair had a verdict. It asks for the next page while
+  queue.py more DIR ID PAGE [KIND]
       says (exit 0) that the list holds more than its pages so far: it counts more, and PAGE is
       below MAX_PAGES. Artifacts of others' runs (a fork's pull request) can come before ours.
   queue.py runs DIR
       the runs that uploaded them, one per line, of those that could be ours. The job saves each
       as DIR/run-<run id>.json.
   queue.py plan DIR
-      prints `matrix=<JSON>` for $GITHUB_OUTPUT: the entries not re-checked yet, every value a
-      string. An entry is re-checked only when its artifact was uploaded by a run of queue.yml on
-      this repository's main: any workflow of a branch, a pull request from a fork, and the other
-      workflows here can upload an artifact of that name too.
+      prints `matrix=<JSON>` for $GITHUB_OUTPUT: the entries not re-checked yet and not given up,
+      every value a string. An artifact counts only when a run of queue.yml on this repository's
+      main uploaded it: any workflow of a branch, a pull request from a fork, and the other
+      workflows here can upload an artifact of that name too. An entry is given up once MAX_STOPS
+      such runs stopped its check; our server's own time limit then ends it.
 recheck.yml runs:
   queue.py entry [RELEASES]
       checks the one entry given by the variables ID, REPO, COMMIT, RUN_ID, ARTIFACT_ID, SIGNER_SHA
-      and MANIFEST,
-      and with RELEASES that its signer_sha is a release's, and prints it as entry.json.
+      and MANIFEST, and with RELEASES that its signer_sha is a release this repository re-checks,
+      and prints it as entry.json.
   queue.py pin LEAN_YML
       prints the commit at which lean.yml pins the check action.
   queue.py same-entry RESULT
       checks that a validated result.json is for that entry's repository and commit.
+  queue.py result RESULT
+      prints `predicate-type=<its schema>` and `sanity=<its sanity>` for $GITHUB_OUTPUT, if its
+      schema is SCHEMA and its sanity one of SANITY; fails otherwise.
 """
 import hashlib
 import json
@@ -64,6 +70,20 @@ KEYS = frozenset({'id', 'repo', 'commit', 'run_id', 'artifact_id', 'signer_sha',
 # verificationalliance/recheck, and the workflow whose runs upload our re-checks.
 REPO_ID = 1471096694
 QUEUE_WORKFLOW = '.github/workflows/queue.yml'
+# The workflow releases this repository re-checks: each one's commit, and the commit of the check
+# action its lean.yml pins. recheck.yml runs that action by a step for each; tests/test_workflows.py
+# checks both against verificationalliance/verify.
+RELEASES = {
+    10: ('6fdf9a0870d09204e776d2fc357d96acb3258eb8', 'e857d7a7e58ca573a3d233f8547c5c62b5fd82f1'),
+}
+# The result's schema, which names the predicate type it is signed under, and how far its sanity
+# step got (vacheck 2.0.2's result.py).
+SCHEMA = 'https://verificationalliance.org/attestations/proof-check/v2'
+SANITY = ('complete', 'partial', 'stopped')
+# Runs of queue.yml whose check of an entry stopped, at most: a stop that happens every time would
+# otherwise be tried every 5 minutes until our server's limit.
+MAX_STOPS = 3
+KINDS = {'artifacts': 'osva-recheck-', 'stops': 'osva-recheck-stopped-'}
 
 GENERATED = re.compile(r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?Z')
 ID = re.compile(r'[0-9a-f]{32}')
@@ -91,7 +111,7 @@ R_MANIFEST = 'manifest is not a relative path without ..'
 R_BINDING = 'id is not sha256("<repo>@<run_id>@<artifact_id>")[:32]'
 R_DUPLICATE = 'its id is listed before'
 R_OVER = 'Entries after the 50th dropped.'
-R_RELEASE = 'signer_sha is not the commit of a workflow release of verificationalliance/verify'
+R_RELEASE = 'signer_sha is not the commit of a workflow release this repository re-checks'
 
 
 def _is(pattern, value):
@@ -192,50 +212,61 @@ def _int(value):
     return type(value) is int and value > 0
 
 
-def _page(folder, entry_id, page):
+def _page(folder, entry_id, page, kind):
     """(artifacts, total_count) of a saved page of an entry's artifacts, or None for one that is not."""
-    doc = load_json(os.path.join(folder, 'artifacts-%s-%d.json' % (entry_id, page)), 10 * MAX_BYTES)
+    doc = load_json(os.path.join(folder, '%s-%s-%d.json' % (kind, entry_id, page)), 10 * MAX_BYTES)
     if not (isinstance(doc, dict) and isinstance(doc.get('artifacts'), list) and type(doc.get('total_count')) is int):
         return None
     return doc['artifacts'], doc['total_count']
 
 
-def artifacts_of(folder, entry_id):
-    """An entry's artifacts as its saved pages list them, in order, up to the first that is not a
-    page, as one list in the form recheck_runs reads."""
+def artifacts_of(folder, entry_id, kind='artifacts'):
+    """An entry's artifacts of a kind as its saved pages list them, in order, up to the first that is
+    not a page, as one list in the form recheck_runs and stopped_runs read."""
     found = []
     for page in range(1, MAX_PAGES + 1):
-        read = _page(folder, entry_id, page)
+        read = _page(folder, entry_id, page, kind)
         if read is None:
             break
         found += read[0]
     return {'artifacts': found}
 
 
-def more_pages(folder, entry_id, page):
-    """Whether to ask GitHub for page + 1 of an entry's artifacts: pages 1 to `page` are saved, the
-    last of them lists some, all of them fewer than its total_count, and `page` is below MAX_PAGES."""
+def more_pages(folder, entry_id, page, kind='artifacts'):
+    """Whether to ask GitHub for page + 1 of an entry's artifacts of a kind: pages 1 to `page` are
+    saved, the last of them lists some, all of them fewer than its total_count, and `page` is below
+    MAX_PAGES."""
     if not 1 <= page < MAX_PAGES:
         return False
-    read = [_page(folder, entry_id, p) for p in range(1, page + 1)]
+    read = [_page(folder, entry_id, p, kind) for p in range(1, page + 1)]
     if any(r is None for r in read):
         return False
     return bool(read[-1][0]) and sum(len(r[0]) for r in read) < read[-1][1]
 
 
-def recheck_runs(entry_id, doc):
-    """The runs that uploaded an unexpired osva-recheck-<entry_id> in this repository, from its
-    main and not from a fork's, as GitHub's list of artifacts by that name gives them."""
+def _uploads(name, doc):
+    """The runs that uploaded an unexpired artifact `name` in this repository, from its main and not
+    from a fork's, as GitHub's list of artifacts by that name gives them."""
     found = []
     artifacts = doc.get('artifacts') if isinstance(doc, dict) else None
     for a in artifacts if isinstance(artifacts, list) else []:
         run = a.get('workflow_run') if isinstance(a, dict) else None
-        if (isinstance(run, dict) and a.get('name') == 'osva-recheck-' + entry_id and a.get('expired') is False
+        if (isinstance(run, dict) and a.get('name') == name and a.get('expired') is False
                 and _int(run.get('id')) and run.get('repository_id') == REPO_ID
                 and run.get('head_repository_id') == REPO_ID and run.get('head_branch') == 'main'
                 and run['id'] not in found):
             found.append(run['id'])
     return found
+
+
+def recheck_runs(entry_id, doc):
+    """The runs that could have uploaded our re-check of an entry, osva-recheck-<entry_id>."""
+    return _uploads(KINDS['artifacts'] + entry_id, doc)
+
+
+def stopped_runs(entry_id, doc):
+    """The runs that could have stopped checking an entry, by their osva-recheck-stopped-<entry_id>."""
+    return _uploads(KINDS['stops'] + entry_id, doc)
 
 
 def queue_run(doc):
@@ -253,6 +284,13 @@ def done_ids(entries, artifacts, runs):
             if any(queue_run(runs.get(r)) for r in recheck_runs(e['id'], artifacts.get(e['id'])))}
 
 
+def given_up_ids(entries, stops, runs):
+    """The ids of the entries whose check MAX_STOPS runs of queue.yml stopped: stops maps an id to
+    its list of osva-recheck-stopped-<id> artifacts, runs a run id to its record."""
+    return {e['id'] for e in entries
+            if sum(queue_run(runs.get(r)) for r in stopped_runs(e['id'], stops.get(e['id']))) >= MAX_STOPS}
+
+
 def matrix(entries, done_ids):
     """The entries not done yet, in order, with every value a string: the workflow hands each to a
     string input."""
@@ -267,6 +305,11 @@ def releases(ls_remote):
         if m:
             (peeled if m.group(3) else own)[m.group(2)] = m.group(1)
     return {peeled.get(tag, sha) for tag, sha in own.items()}
+
+
+def rechecked(ls_remote):
+    """The releases this repository re-checks that are still the commits of their tags."""
+    return releases(ls_remote) & {signer for signer, _ in RELEASES.values()}
 
 
 def released(entries, shas):
@@ -306,6 +349,14 @@ def same_entry(result, entry):
     return isinstance(result, dict) and result.get('repo') == entry['repo'] and result.get('commit') == entry['commit']
 
 
+def result_facts(result):
+    """(schema, sanity) of a result whose schema is SCHEMA and whose sanity is one of SANITY, or None."""
+    if not isinstance(result, dict) or result.get('schema') != SCHEMA:
+        return None
+    sanity = result.get('sanity')
+    return (SCHEMA, sanity) if isinstance(sanity, str) and sanity in SANITY else None
+
+
 def _read(path):
     with open(path, encoding='utf-8') as f:
         return f.read(MAX_BYTES + 1)
@@ -330,7 +381,7 @@ def _entries(queue_path, releases_path):
     kept, reasons = validate(doc) if doc is not None else ([], [R_NOT_QUEUE])
     if reasons == [R_NOT_QUEUE]:
         return _fail(R_NOT_QUEUE)
-    kept, more = released(kept, releases(_read(releases_path)))
+    kept, more = released(kept, rechecked(_read(releases_path)))
     for reason in reasons + more:
         print('::warning::' + (reason if reason == R_OVER else 'Dropped: ' + reason), file=sys.stderr)
     listed = len(doc['entries'])
@@ -342,19 +393,23 @@ def _entries(queue_path, releases_path):
 
 def _evidence(folder, entries):
     artifacts = {e['id']: artifacts_of(folder, e['id']) for e in entries}
-    return artifacts, sorted({r for e in entries for r in recheck_runs(e['id'], artifacts[e['id']])})
+    stops = {e['id']: artifacts_of(folder, e['id'], 'stops') for e in entries}
+    run_ids = {r for e in entries for r in recheck_runs(e['id'], artifacts[e['id']]) + stopped_runs(e['id'], stops[e['id']])}
+    return artifacts, stops, sorted(run_ids)
 
 
 def _plan(folder):
     entries = _our_entries(os.path.join(folder, 'entries.json'))
     if entries is None:
         return _fail('entries.json is not the entries queue.py wrote.')
-    artifacts, run_ids = _evidence(folder, entries)
+    artifacts, stops, run_ids = _evidence(folder, entries)
     runs = {r: load_json(os.path.join(folder, 'run-%d.json' % r), 10 * MAX_BYTES) for r in run_ids}
     done = done_ids(entries, artifacts, runs)
-    todo = matrix(entries, done)
-    print('Of %s, %d %s re-checked already; %d to re-check.'
-          % (_plural(len(entries), 'entry', 'entries'), len(done), 'is' if len(done) == 1 else 'are', len(todo)),
+    given_up = given_up_ids(entries, stops, runs) - done
+    todo = matrix(entries, done | given_up)
+    print('Of %s, %d %s re-checked already and %d stopped %d times; %d to re-check.'
+          % (_plural(len(entries), 'entry', 'entries'), len(done), 'is' if len(done) == 1 else 'are',
+             len(given_up), MAX_STOPS, len(todo)),
           file=sys.stderr)
     print('matrix=' + json.dumps(todo, separators=(',', ':')))
     return 0
@@ -370,23 +425,24 @@ def main(argv, env):
             return _fail('entries.json is not the entries queue.py wrote.')
         sys.stdout.write(''.join(e['id'] + '\n' for e in entries))
         return 0
-    if args[:1] == ['more'] and len(args) == 4:
-        if not (_is(ID, args[2]) and _is(RUN_ID, args[3])):
-            return _fail('more takes a folder, an id and a page number.')
-        return 0 if more_pages(args[1], args[2], int(args[3])) else 1
+    if args[:1] == ['more'] and len(args) in (4, 5):
+        kind = args[4] if len(args) == 5 else 'artifacts'
+        if not (_is(ID, args[2]) and _is(RUN_ID, args[3]) and kind in KINDS):
+            return _fail('more takes a folder, an id, a page number and artifacts or stops.')
+        return 0 if more_pages(args[1], args[2], int(args[3]), kind) else 1
     if args[:1] == ['runs'] and len(args) == 2:
         entries = _our_entries(os.path.join(args[1], 'entries.json'))
         if entries is None:
             return _fail('entries.json is not the entries queue.py wrote.')
-        sys.stdout.write(''.join('%d\n' % r for r in _evidence(args[1], entries)[1]))
+        sys.stdout.write(''.join('%d\n' % r for r in _evidence(args[1], entries)[2]))
         return 0
     if args[:1] == ['plan'] and len(args) == 2:
         return _plan(args[1])
     if args[:1] == ['entry'] and len(args) <= 2:
-        shas = releases(_read(args[1])) if len(args) == 2 else None
+        shas = rechecked(_read(args[1])) if len(args) == 2 else None
         entry = entry_from_env(env, shas)
         if entry is None:
-            return _fail('The entry is not one: each field must match its pattern, and the signer must be a release.')
+            return _fail('The entry is not one: each field must match its pattern, and the signer must be a release re-checked here.')
         sys.stdout.write(canonical(entry))
         return 0
     if args[:1] == ['pin'] and len(args) == 2:
@@ -400,8 +456,14 @@ def main(argv, env):
         if entry is None or not same_entry(load_json(args[1], 10 * MAX_BYTES), entry):
             return _fail("The result is not for the entry's repository and commit.")
         return 0
-    print('usage: queue.py entries QUEUE RELEASES | ids ENTRIES | more DIR ID PAGE | runs DIR | plan DIR'
-          ' | entry [RELEASES] | pin LEAN_YML | same-entry RESULT', file=sys.stderr)
+    if args[:1] == ['result'] and len(args) == 2:
+        facts = result_facts(load_json(args[1], 10 * MAX_BYTES))
+        if facts is None:
+            return _fail('The result is not of schema %s with a sanity of complete, partial or stopped.' % SCHEMA)
+        print('predicate-type=%s\nsanity=%s' % facts)
+        return 0
+    print('usage: queue.py entries QUEUE RELEASES | ids ENTRIES | more DIR ID PAGE [KIND] | runs DIR | plan DIR'
+          ' | entry [RELEASES] | pin LEAN_YML | same-entry RESULT | result RESULT', file=sys.stderr)
     return 2
 
 

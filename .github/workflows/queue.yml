@@ -70,16 +70,20 @@ jobs:
           # The workflow releases: a signer_sha must be the commit of one.
           git ls-remote --tags https://github.com/verificationalliance/verify 'refs/tags/workflow-*' > "$dir/releases"
           python3 -I scripts/queue.py entries "$dir/queue.json" "$dir/releases" > "$dir/entries.json"
-          # The re-checks done: each entry's artifact osva-recheck-<id>, every page of the list (others'
-          # artifacts by that name can come first; queue.py says when to stop), and the runs that
-          # uploaded one. queue.py counts only a run of queue.yml on this repository's main.
+          # The re-checks done and the checks stopped: each entry's artifacts osva-recheck-<id> and
+          # osva-recheck-stopped-<id>, every page of each list (others' artifacts by those names can
+          # come first; queue.py says when to stop), and the runs that uploaded one. queue.py counts
+          # only a run of queue.yml on this repository's main.
           while read -r id; do
-            page=1
-            while true; do
-              gh api "repos/verificationalliance/recheck/actions/artifacts?name=osva-recheck-$id&per_page=100&page=$page" \
-                > "$dir/artifacts-$id-$page.json"
-              python3 -I scripts/queue.py more "$dir" "$id" "$page" || break
-              page=$((page + 1))
+            for kind in artifacts stops; do
+              if [[ $kind == stops ]]; then name=osva-recheck-stopped-$id; else name=osva-recheck-$id; fi
+              page=1
+              while true; do
+                gh api "repos/verificationalliance/recheck/actions/artifacts?name=$name&per_page=100&page=$page" \
+                  > "$dir/$kind-$id-$page.json"
+                python3 -I scripts/queue.py more "$dir" "$id" "$page" "$kind" || break
+                page=$((page + 1))
+              done
             done
           done < <(python3 -I scripts/queue.py ids "$dir/entries.json")
           while read -r run; do
