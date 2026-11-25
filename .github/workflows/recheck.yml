@@ -1,0 +1,237 @@
+# Our re-check of one signed proof result. queue.yml calls it once for each entry of the queue our
+# server publishes; it is our signer workflow, and its attestation is the one our server and
+# `gh attestation verify --signer-workflow verificationalliance/recheck/.github/workflows/recheck.yml`
+# check.
+#
+# It runs the same check as the developer's run: verificationalliance/verify's composite action
+# .github/actions/check, at the commit that the signing release's lean.yml pins. The action checks
+# out the developer's commit and replays the export the developer's build job made, downloaded from
+# that run; the export is never trusted, only replayed and compared. Our result must then equal the
+# developer's byte for byte, which our server checks.
+#
+# The trust boundary is lean.yml's:
+# - `check` runs nothing from the repository: the action's sandboxed steps only. It has no id-token.
+# - `sign` runs no Lean and never sees the export. It receives result.json as a job output, never as
+#   an artifact (any job of the run can upload one), validates it, checks that it is for the entry's
+#   repository and commit, and has GitHub sign it.
+# One entry per call is what keeps that so: the jobs of a matrix share one set of outputs, and a
+# call has its own.
+#
+# A workflow of another repository could call this one, so every job runs only in ours: the
+# condition is GitHub's to evaluate, not the runner's.
+#
+# The entry's fields reach the steps only through env and `with:`, after scripts/queue.py has
+# checked each against its pattern, and none is printed: no text from a developer's repository or
+# export reaches the log unescaped.
+name: recheck
+
+on:
+  workflow_call:
+    inputs:
+      id:
+        description: The queue entry's id, 32 hex digits.
+        type: string
+        required: true
+      repo:
+        description: The repository, as github.com/<owner>/<name>.
+        type: string
+        required: true
+      commit:
+        description: The commit, by its full SHA.
+        type: string
+        required: true
+      run-id:
+        description: The developer's run, whose build job made the export.
+        type: string
+        required: true
+      signer-sha:
+        description: The commit of verificationalliance/verify whose lean.yml signed the result.
+        type: string
+        required: true
+      manifest:
+        description: The manifest path that run's lean.yml was given.
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+env:
+  # lean.yml's checker in workflow-7; job sign only validates with it.
+  VACHECK_URL: https://github.com/verificationalliance/verify/releases/download/v1.1.4/vacheck.pyz
+  VACHECK_SHA256: 3e5881d0863b3edcd679b4029b1e8a0534576c119d601f8268299d02c999a33b
+  # The base64 of vacheck's largest result (96,000 bytes), as lean.yml takes it.
+  MAX_RESULT_B64: "128000"
+
+jobs:
+  check:
+    name: check
+    if: github.repository == 'verificationalliance/recheck'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      result: ${{ steps.result.outputs.result }}
+    steps:
+      - name: Check out the re-check's scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: recheck
+          persist-credentials: false
+
+      - name: Check the entry
+        id: entry
+        env:
+          ID: ${{ inputs.id }}
+          REPO: ${{ inputs.repo }}
+          COMMIT: ${{ inputs.commit }}
+          RUN_ID: ${{ inputs.run-id }}
+          SIGNER_SHA: ${{ inputs.signer-sha }}
+          MANIFEST: ${{ inputs.manifest }}
+        run: |
+          python3 -I recheck/scripts/queue.py entry > /dev/null
+          echo "repository=${REPO#github.com/}" >> "$GITHUB_OUTPUT"
+
+      - name: Check out the release that signed the result
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: verificationalliance/verify
+          ref: ${{ inputs.signer-sha }}
+          path: signer
+          persist-credentials: false
+
+      - name: Read the check action's pin
+        id: pin
+        run: |
+          pin=$(python3 -I recheck/scripts/queue.py pin signer/.github/workflows/lean.yml)
+          echo "pin=$pin" >> "$GITHUB_OUTPUT"
+          echo "The release's lean.yml runs the check action at $pin."
+
+      # In the workspace, as `uses: ./` requires. The runner reads the action when its step starts,
+      # and the action's first checkout then replaces the workspace with the developer's commit:
+      # vacheck hashes every file of the checkout, so nothing of ours may be left in it.
+      - name: Check out the check action at that pin
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: verificationalliance/verify
+          ref: ${{ steps.pin.outputs.pin }}
+          path: verify-action
+          persist-credentials: false
+
+      # scripts/release.sh's rule, checked again: the action at the pin is the release's own
+      # .github/actions/check, file for file.
+      - name: Require the release's own check action
+        run: |
+          release=$(git -C signer rev-parse 'HEAD:.github/actions/check')
+          pinned=$(git -C verify-action rev-parse 'HEAD:.github/actions/check')
+          if [[ $release != "$pinned" ]]; then
+            echo "::error::The check action at the pin is not the release's own."
+            exit 1
+          fi
+          rm -rf recheck signer
+          echo "The check action at the pin is the release's own: tree $pinned."
+
+      - name: Check the export
+        id: result
+        uses: ./verify-action/.github/actions/check
+        with:
+          manifest: ${{ inputs.manifest }}
+          repository: ${{ steps.entry.outputs.repository }}
+          commit: ${{ inputs.commit }}
+          export-run-id: ${{ inputs.run-id }}
+          export-repository: ${{ steps.entry.outputs.repository }}
+          github-token: ${{ github.token }}
+
+  sign:
+    name: sign
+    if: github.repository == 'verificationalliance/recheck'
+    needs: check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      # GitHub's standard runners for ubuntu-24.04, as lean.yml's sign job requires.
+      - name: Require a standard GitHub-hosted runner
+        run: |
+          os=$(. /etc/os-release && echo "$ID $VERSION_ID")
+          if [[ ${RUNNER_ENVIRONMENT:-} != github-hosted || ${ImageOS:-} != ubuntu24 || $os != "ubuntu 24.04" ]] \
+              || ! [[ ${ImageVersion:-} =~ ^[0-9]{8}\.[0-9]+(\.[0-9]+)?$ && ${RUNNER_NAME:-} =~ ^GitHub\ Actions\ [0-9]+$ ]]; then
+            echo "::error::This job runs only on a standard GitHub-hosted ubuntu-24.04 runner, not a larger or self-hosted one."
+            exit 1
+          fi
+          echo "Runner $RUNNER_NAME, image $ImageOS $ImageVersion, $os."
+
+      - name: Check out the re-check's scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: recheck
+          persist-credentials: false
+
+      - name: Get the checker
+        run: |
+          va="$RUNNER_TEMP/va"
+          mkdir -p "$va"
+          curl -fsSL --proto '=https' --retry 3 -o "$va/vacheck.pyz" "$VACHECK_URL"
+          echo "$VACHECK_SHA256  $va/vacheck.pyz" | sha256sum -c -
+
+      # As lean.yml's sign job: canonical JSON that vacheck accepts, for the entry's repository and
+      # commit. entry.json is the entry as queue.py checked and wrote it, never the queue's bytes.
+      - name: Validate the result
+        env:
+          RESULT: ${{ needs.check.outputs.result }}
+          ID: ${{ inputs.id }}
+          REPO: ${{ inputs.repo }}
+          COMMIT: ${{ inputs.commit }}
+          RUN_ID: ${{ inputs.run-id }}
+          SIGNER_SHA: ${{ inputs.signer-sha }}
+          MANIFEST: ${{ inputs.manifest }}
+        run: |
+          va="$RUNNER_TEMP/va"
+          if (( ${#RESULT} > MAX_RESULT_B64 )) || ! [[ "$RESULT" =~ ^[A-Za-z0-9+/]+=*$ ]]; then
+            echo "::error::The result from job check is not the base64 of at most 96,000 bytes."
+            exit 1
+          fi
+          python3 -I recheck/scripts/queue.py entry > entry.json
+          printf '%s' "$RESULT" | base64 -d > "$va/received.json"
+          python3 -I "$va/vacheck.pyz" validate "$va/received.json" > result.json
+          if ! cmp -s "$va/received.json" result.json; then
+            echo "::error::The result from job check is not canonical JSON."
+            exit 1
+          fi
+          python3 -I recheck/scripts/queue.py same-entry result.json
+          echo "result.json: sha256 $(sha256sum < result.json | cut -d ' ' -f 1)"
+
+      - name: Sign the result
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: result.json
+          predicate-type: https://verificationalliance.org/attestations/proof-check/v1
+          predicate-path: result.json
+
+      - name: Keep the bundle
+        env:
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: cp -- "$BUNDLE" result.sigstore.json
+
+      # Replaces any artifact of that name that another job of the run uploaded.
+      - name: Upload the re-check
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: osva-recheck-${{ inputs.id }}
+          path: |
+            result.json
+            result.sigstore.json
+            entry.json
+          retention-days: 7
+          overwrite: true
+          if-no-files-found: error

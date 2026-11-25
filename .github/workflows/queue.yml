@@ -1,0 +1,99 @@
+# Every 5 minutes: reads the queue of signed results waiting for our re-check, which our server
+# publishes, and calls recheck.yml once for each entry not re-checked yet. recheck.yml uploads its
+# signed result as the artifact osva-recheck-<id>, which our server collects; an entry whose
+# artifact is here is done.
+#
+# A maintainer can also start it by hand, with queue-url naming a test queue in this repository.
+#
+# The queue is our server's, but its fields reach checkouts, artifact names and steps, so
+# scripts/queue.py checks each against its pattern first, and drops an entry that fails with a fixed
+# reason. Nothing of an entry is printed.
+name: queue
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      queue-url:
+        description: "Maintainers only: a test queue, https://raw.githubusercontent.com/verificationalliance/recheck/<ref>/<path>"
+        type: string
+        required: false
+        default: ""
+
+# One run at a time, and none cancelled: an entry being re-checked is never re-checked twice at once.
+concurrency:
+  group: recheck
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - name: Check out the scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Read the queue
+        id: plan
+        env:
+          QUEUE_URL: ${{ inputs.queue-url }}
+          DEFAULT_URL: https://verificationalliance.org/data/recheck-pending.json
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          url=${QUEUE_URL:-$DEFAULT_URL}
+          test='^https://raw\.githubusercontent\.com/verificationalliance/recheck/[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+$'
+          if [[ $url != "$DEFAULT_URL" ]] && ! [[ $url =~ $test && $url != *..* ]]; then
+            echo "::error::queue-url must name a file of verificationalliance/recheck on raw.githubusercontent.com."
+            exit 1
+          fi
+          curl -fsS --proto '=https' --tlsv1.2 --retry 3 --max-time 60 --max-filesize 1000000 \
+            -o "$RUNNER_TEMP/queue.json" "$url"
+          # The re-checks done: this repository's artifacts that have not expired.
+          gh api --paginate 'repos/verificationalliance/recheck/actions/artifacts?per_page=100' \
+            --jq '.artifacts[] | select(.expired | not) | .name' > "$RUNNER_TEMP/artifacts"
+          # The workflow releases: a signer_sha must be the commit of one.
+          git ls-remote --tags https://github.com/verificationalliance/verify 'refs/tags/workflow-*' \
+            > "$RUNNER_TEMP/releases"
+          python3 -I scripts/queue.py plan "$RUNNER_TEMP/queue.json" "$RUNNER_TEMP/artifacts" \
+            "$RUNNER_TEMP/releases" >> "$GITHUB_OUTPUT"
+
+  # The job's permissions are what recheck.yml's jobs may have at most: its check job takes
+  # contents and actions read only, its sign job id-token and attestations write.
+  recheck:
+    name: recheck ${{ matrix.entry.id }}
+    needs: plan
+    if: needs.plan.outputs.matrix != '[]'
+    strategy:
+      matrix:
+        entry: ${{ fromJSON(needs.plan.outputs.matrix) }}
+      max-parallel: 2
+      fail-fast: false
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/recheck.yml
+    with:
+      id: ${{ matrix.entry.id }}
+      repo: ${{ matrix.entry.repo }}
+      commit: ${{ matrix.entry.commit }}
+      run-id: ${{ matrix.entry.run_id }}
+      signer-sha: ${{ matrix.entry.signer_sha }}
+      manifest: ${{ matrix.entry.manifest }}
