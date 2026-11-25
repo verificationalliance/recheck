@@ -369,6 +369,13 @@ class TestQueue(unittest.TestCase):
         self.assertEqual(q.REPO_ID, 1471096694)
         self.assertEqual(q.QUEUE_WORKFLOW, '.github/workflows/queue.yml')
 
+    def test_schedule(self):
+        """Every 5 minutes, off the hour: GitHub delays and may drop scheduled runs at the start of
+        every hour."""
+        text = '\n'.join(self.lines)
+        self.assertIn('on:\n', text)
+        self.assertEqual(re.findall(r'^ *- cron: (.*)$', text, re.M), ['"2-59/5 * * * *"'])
+
     def test_recheck_job(self):
         recheck = jobs(self.lines)['recheck']
         self.assertIn("    if: github.repository == 'verificationalliance/recheck' && needs.plan.outputs.matrix != '[]'", recheck)
