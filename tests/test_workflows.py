@@ -116,6 +116,22 @@ class TestWorkflows(unittest.TestCase):
         for i in jobs:
             self.assertIn("    if: github.repository == 'verificationalliance/recheck'", block(lines, i))
 
+    def test_check_action_put_back(self):
+        """The runner reads a local action again for its post steps, after the action's checkout
+        made the workspace the developer's commit: our copy, made before the check, goes back in
+        a step that always runs."""
+        text = '\n'.join(workflows()['recheck.yml'])
+        text = text[text.index('\n  check:'):text.index('\n  sign:') + 1]
+        names = re.findall(r'^      - name: (.*)$', text, re.M)
+        check = names.index('Check the export')
+        self.assertEqual(names[check + 1:], ['Put the check action back for its post steps'])
+        put_back = text[text.index('- name: Put the check action back'):]
+        self.assertIn('        if: always()\n', put_back)
+        self.assertIn('rm -rf -- "$GITHUB_WORKSPACE/verify-action"', put_back)
+        self.assertIn('cp -a -- "$RUNNER_TEMP/check-action" "$GITHUB_WORKSPACE/verify-action"', put_back)
+        before = text[:text.index('- name: Check the export')]
+        self.assertIn('cp -a verify-action "$RUNNER_TEMP/check-action"', before)
+
     def test_check_action(self):
         text = '\n'.join(workflows()['recheck.yml'])
         self.assertEqual(re.findall(r'^ *(?:- )?uses: (\./.*)$', text, re.M), ['./verify-action/.github/actions/check'])

@@ -332,6 +332,9 @@ class TestCommand(unittest.TestCase):
     def test_plan_with_nothing_to_do(self):
         out = self.run_script('plan', *self.files(json.dumps(doc()), '', ''))
         self.assertEqual((out.returncode, out.stdout), (0, 'matrix=[]\n'))
+        out = self.run_script('plan', *self.files(json.dumps(doc(GOOD)), 'osva-recheck-' + GOOD['id'], ''))
+        self.assertEqual(out.stdout, 'matrix=[]\n')
+        self.assertIn('The queue lists 1 entry: 0 to re-check, 0 of them done; 1 dropped.', out.stderr)
 
     def test_entry_and_same_entry(self):
         env = {'ID': GOOD['id'], 'REPO': GOOD['repo'], 'COMMIT': GOOD['commit'], 'RUN_ID': str(GOOD['run_id']),

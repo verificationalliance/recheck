@@ -115,7 +115,8 @@ jobs:
 
       # In the workspace, as `uses: ./` requires. The runner reads the action when its step starts,
       # and the action's first checkout then replaces the workspace with the developer's commit:
-      # vacheck hashes every file of the checkout, so nothing of ours may be left in it.
+      # vacheck hashes every file of the checkout, so nothing of ours may be left in it. A copy
+      # outside the workspace is put back for the action's post steps.
       - name: Check out the check action at that pin
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -135,6 +136,7 @@ jobs:
             exit 1
           fi
           rm -rf recheck signer
+          cp -a verify-action "$RUNNER_TEMP/check-action"
           echo "The check action at the pin is the release's own: tree $pinned."
 
       - name: Check the export
@@ -147,6 +149,17 @@ jobs:
           export-run-id: ${{ inputs.run-id }}
           export-repository: ${{ steps.entry.outputs.repository }}
           github-token: ${{ github.token }}
+
+      # The runner reads the action's definition again for its post steps, from verify-action/, and
+      # by then the workspace is the developer's commit, which may hold a verify-action/ of its own.
+      # Our copy goes back first, whatever happened to the check.
+      - name: Put the check action back for its post steps
+        if: always()
+        run: |
+          rm -rf -- "$GITHUB_WORKSPACE/verify-action"
+          if [[ -d $RUNNER_TEMP/check-action ]]; then
+            cp -a -- "$RUNNER_TEMP/check-action" "$GITHUB_WORKSPACE/verify-action"
+          fi
 
   sign:
     name: sign

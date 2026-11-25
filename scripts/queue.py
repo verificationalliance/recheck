@@ -220,8 +220,9 @@ def _plan(queue_path, artifacts_path, releases_path):
         print('::warning::Dropped: ' + reason if reason != R_OVER else '::warning::' + reason, file=sys.stderr)
     done = done_ids(_read(artifacts_path))
     todo = matrix(kept, done)
-    print('The queue lists %d entries: %d to re-check, %d of them done; %d dropped.'
-          % (len(doc['entries']), len(kept), len(kept) - len(todo), len(doc['entries']) - len(kept)),
+    listed = len(doc['entries'])
+    print('The queue lists %d %s: %d to re-check, %d of them done; %d dropped.'
+          % (listed, 'entry' if listed == 1 else 'entries', len(kept), len(kept) - len(todo), listed - len(kept)),
           file=sys.stderr)
     print('matrix=' + json.dumps(todo, separators=(',', ':')))
     return 0
