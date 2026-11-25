@@ -45,6 +45,10 @@ on:
         description: The developer's run, whose build job made the export.
         type: string
         required: true
+      artifact-id:
+        description: That run's signed result, the artifact osva-proof-result; only bound into entry.json.
+        type: string
+        required: true
       signer-sha:
         description: The commit of verificationalliance/verify whose lean.yml signed the result.
         type: string
@@ -94,6 +98,7 @@ jobs:
           REPO: ${{ inputs.repo }}
           COMMIT: ${{ inputs.commit }}
           RUN_ID: ${{ inputs.run-id }}
+          ARTIFACT_ID: ${{ inputs.artifact-id }}
           SIGNER_SHA: ${{ inputs.signer-sha }}
           MANIFEST: ${{ inputs.manifest }}
         run: |
@@ -185,6 +190,7 @@ jobs:
           REPO: ${{ inputs.repo }}
           COMMIT: ${{ inputs.commit }}
           RUN_ID: ${{ inputs.run-id }}
+          ARTIFACT_ID: ${{ inputs.artifact-id }}
           SIGNER_SHA: ${{ inputs.signer-sha }}
           MANIFEST: ${{ inputs.manifest }}
         run: |
